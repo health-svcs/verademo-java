@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   bootstrap:
@@ -42,11 +43,22 @@ jobs:
           echo "Target: ${TARGET_REPO}"
           echo "Overwrite: ${OVERWRITE}"
 
-          curl -sS \
+          # Fetch source variables with HTTP status + body diagnostics
+          status=$(curl -sS -o source_vars.json -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "${API}/repos/${SOURCE_REPO}/actions/variables?per_page=100" \
-            > source_vars.json
+            "${API}/repos/${SOURCE_REPO}/actions/variables?per_page=100")
+
+          echo "HTTP status: ${status}"
+          echo "=== source_vars.json ==="
+          cat source_vars.json
+          echo
+          echo "========================"
+
+          if [ "${status}" != "200" ]; then
+            echo "ERROR: GitHub API call failed to read source repo variables."
+            exit 1
+          fi
 
           python3 - <<'PY'
           import os, json, urllib.request, urllib.error, pathlib
@@ -89,6 +101,7 @@ jobs:
                       skipped += 1
                       continue
 
+              # Try update first, create if missing
               st, body = req("PATCH", f"{api}/repos/{target_repo}/actions/variables/{name}", {"name": name, "value": value})
               if st == 404:
                   st, body = req("POST", f"{api}/repos/{target_repo}/actions/variables", {"name": name, "value": value})
@@ -97,11 +110,10 @@ jobs:
                   print(f"OK: {name}")
                   ok += 1
               else:
-                  print(f"FAIL: {name} status={st} body={body[:300]}")
+                  print(f"FAIL: {name} status={st} body={body[:500]}")
                   failed += 1
 
           print(f"Done. ok={ok} skipped={skipped} failed={failed}")
           if failed:
               raise SystemExit(1)
           PY
-
