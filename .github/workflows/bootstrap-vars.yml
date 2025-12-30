@@ -1,1 +1,107 @@
-d
+name: Bootstrap repo variables from canonical repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Canonical repo to copy variables from (OWNER/REPO)
+        required: true
+        default: health-svcs/secure-petstore.api
+      overwrite:
+        description: Overwrite variables if they already exist
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy repo variables from source repo into this repo
+        env:
+          GH_TOKEN: ${{ secrets.VAR_SYNC_TOKEN }}
+          API: https://api.github.com
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          TARGET_REPO: ${{ github.repository }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "Missing secret VAR_SYNC_TOKEN in this repo."
+            exit 1
+          fi
+
+          echo "Source: ${SOURCE_REPO}"
+          echo "Target: ${TARGET_REPO}"
+          echo "Overwrite: ${OVERWRITE}"
+
+          curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/repos/${SOURCE_REPO}/actions/variables?per_page=100" \
+            > source_vars.json
+
+          python3 - <<'PY'
+          import os, json, urllib.request, urllib.error, pathlib
+
+          token = os.environ["GH_TOKEN"]
+          api = os.environ["API"]
+          source_repo = os.environ["SOURCE_REPO"]
+          target_repo = os.environ["TARGET_REPO"]
+          overwrite = os.environ["OVERWRITE"].lower() == "true"
+
+          src = json.loads(pathlib.Path("source_vars.json").read_text())
+          vars_list = src.get("variables", [])
+
+          def req(method, url, body=None):
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              r = urllib.request.Request(url, data=data, method=method)
+              r.add_header("Authorization", f"Bearer {token}")
+              r.add_header("Accept", "application/vnd.github+json")
+              if body is not None:
+                  r.add_header("Content-Type", "application/json")
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      return resp.status, resp.read().decode("utf-8")
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8")
+
+          print(f"Found {len(vars_list)} variables in {source_repo}")
+          print(f"Copying -> {target_repo} (overwrite={overwrite})")
+
+          ok = skipped = failed = 0
+
+          for v in vars_list:
+              name = v["name"]
+              value = v.get("value", "")
+
+              if not overwrite:
+                  st, _ = req("GET", f"{api}/repos/{target_repo}/actions/variables/{name}")
+                  if st == 200:
+                      print(f"SKIP: {name}")
+                      skipped += 1
+                      continue
+
+              st, body = req("PATCH", f"{api}/repos/{target_repo}/actions/variables/{name}", {"name": name, "value": value})
+              if st == 404:
+                  st, body = req("POST", f"{api}/repos/{target_repo}/actions/variables", {"name": name, "value": value})
+
+              if 200 <= st < 300:
+                  print(f"OK: {name}")
+                  ok += 1
+              else:
+                  print(f"FAIL: {name} status={st} body={body[:300]}")
+                  failed += 1
+
+          print(f"Done. ok={ok} skipped={skipped} failed={failed}")
+          if failed:
+              raise SystemExit(1)
+          PY
+
