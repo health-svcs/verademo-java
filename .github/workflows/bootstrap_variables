@@ -6,7 +6,7 @@ on:
       source_repo:
         description: Canonical repo to copy variables from (OWNER/REPO)
         required: true
-        default: secure-care-corp/petstore-api
+        default: health-svcs/secure-petstore.api
       overwrite:
         description: Overwrite variables if they already exist
         required: true
