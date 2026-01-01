@@ -1,24 +1,24 @@
-name: Provision EC2 + Build & Deploy API
+name: Provision EC2 + Build & Deploy verademo-java (LiveDemo)
 
 on:
   workflow_dispatch:
     inputs:
       APP_NAME:
-        description: "App label for DNS/ECR (petstore.api, verademo.api, etc)"
+        description: "App label for DNS/ECR (e.g., verademo.java)"
         required: false
-        default: "petstore.api"
+        default: "verademo.java"
         type: string
 
       SA_ACRONYM:
         description: "3-letter SA acronym for stable DNS (agc, elg, etc)"
         required: true
-        default: "agc"
+        default: "xxx"
         type: string
 
       TlsMode:
         description: "TLS posture applied at deploy time (NGINX): Weak or Secure"
         required: true
-        default: "Weak"
+        default: "Secure"
         type: choice
         options:
           - Weak
@@ -30,21 +30,24 @@ on:
         default: false
         type: boolean
 
-  push:
-    branches: ["main"]
-
 env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
-  APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-  SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
-  TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
+  # Per-app master defaults (override via inputs if desired)
+  APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT || 'verademo.java' }}
+  SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT || 'xxx' }}
+  TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Secure' }}
+
+  # verademo-java container typically listens on 8080 (NGINX terminates TLS on 443 and proxies to this)
+  APP_PORT: ${{ vars.APP_PORT || '8080' }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME || 'verademo-java' }}
 
   # Boolean -> string "true"/"false"
   DEBUG_LOGS: ${{ (inputs.DEBUG_LOGS && 'true') || 'false' }}
 
-  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
+  # ECR repo name: derived from APP_NAME but sanitized for ECR
+  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT || 'verademo.java' }}
   IMAGE_TAG: ${{ github.run_id }}
 
   TEMPLATE_FILE: cloudformation/ec2.yaml
@@ -76,13 +79,16 @@ jobs:
           require "INSTANCE_PROFILE_NAME" "${{ vars.INSTANCE_PROFILE_NAME }}"
           require "KEY_NAME" "${{ vars.KEY_NAME }}"
 
-          require "APP_NAME_DEFAULT" "${{ vars.APP_NAME_DEFAULT }}"
-          require "SA_ACRONYM_DEFAULT" "${{ vars.SA_ACRONYM_DEFAULT }}"
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
           require "SA_BASE_DOMAIN" "${{ vars.SA_BASE_DOMAIN }}"
 
           if ! [[ "${DNS_TTL}" =~ ^[0-9]+$ ]]; then
             echo "ERROR: DNS_TTL must be numeric, got: '${DNS_TTL}'"
+            exit 1
+          fi
+
+          if ! [[ "${APP_PORT}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: APP_PORT must be numeric, got: '${APP_PORT}'"
             exit 1
           fi
 
@@ -124,15 +130,16 @@ jobs:
           ACR="$(norm "${SA_ACRONYM}")"
           BASE="$(norm "${DNS_BASE_DOMAIN}")"
 
-          # Stack name: include ORG + REPO (repo already includes SA acronym), omit actor/app redundancy
+          # Stack name: include ORG + REPO, unique per run id
           ORG_NAME="${GITHUB_REPOSITORY%%/*}"     # e.g. health-svcs
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"    # e.g. agc-petstore.api
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"    # e.g. verademo-java
           SAFE_ORG="$(echo "${ORG_NAME}"  | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           SAFE_REPO="$(echo "${REPO_NAME}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_ORG}-${SAFE_REPO}-ec2-${GITHUB_RUN_ID}"
 
+          # ECR repo must be lowercase and cannot contain dots; keep slashes/hyphens
           SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
-          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
+          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="verademo-java"
 
           echo "Stack: ${STACK_NAME}"
           aws cloudformation deploy \
@@ -160,7 +167,7 @@ jobs:
             --stack-name "${STACK_NAME}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
-          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
+          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance (LogicalResourceId must be 'ApiInstance')"; exit 1; }
 
           aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
           aws ec2 wait instance-status-ok --instance-ids "${INSTANCE_ID}"
@@ -266,6 +273,7 @@ jobs:
           aws ecr get-login-password --region "${AWS_REGION}" | \
             docker login --username AWS --password-stdin "${REGISTRY}"
 
+          # If your Dockerfile is not at repo root, adjust build context accordingly.
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
 
@@ -294,8 +302,10 @@ jobs:
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           TLS_MODE="${TLS_MODE}"
           DEBUG="${DEBUG_LOGS}"
+          APP_PORT="${APP_PORT}"
+          CONTAINER_NAME="${CONTAINER_NAME}"
 
-          export IMAGE_URI TLS_MODE DEBUG
+          export IMAGE_URI TLS_MODE DEBUG APP_PORT CONTAINER_NAME
 
           python3 - <<'PY'
           import base64, json, os
@@ -303,6 +313,8 @@ jobs:
           image = os.environ["IMAGE_URI"]
           tls = (os.environ.get("TLS_MODE","Weak") or "Weak").strip().lower()
           debug = (os.environ.get("DEBUG","false") or "false").strip().lower()
+          port = int((os.environ.get("APP_PORT","8080") or "8080").strip())
+          cname = (os.environ.get("CONTAINER_NAME","verademo-java") or "verademo-java").strip()
 
           if tls == "secure":
               nginx_tls = "\n".join([
@@ -330,7 +342,7 @@ jobs:
               return 200 "mode={mode_text}\\n";
             }}
             location / {{
-              proxy_pass http://127.0.0.1:5000;
+              proxy_pass http://127.0.0.1:{port};
             }}
           }}
           """
@@ -341,7 +353,7 @@ jobs:
           b64_dcfg  = base64.b64encode(docker_cfg.encode()).decode()
 
           commands = [
-            # IMPORTANT: SSM RunShellScript is executed by /bin/sh (dash). No pipefail.
+            # IMPORTANT: SSM RunShellScript uses /bin/sh (dash). No pipefail.
             "set -eu",
 
             "echo '=== OS ==='; cat /etc/os-release || true",
@@ -378,23 +390,24 @@ jobs:
 
             "echo '=== Pull & run container ==='",
             f"sudo docker pull '{image}'",
-            "sudo docker rm -f petstore || true",
-            f"sudo docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 '{image}'",
+            f"sudo docker rm -f {cname} || true",
+            # bind container port to localhost only; nginx proxies to it
+            f"sudo docker run -d --name {cname} --restart unless-stopped -p 127.0.0.1:{port}:{port} '{image}'",
 
             "echo '=== Diagnostics (slim) ==='",
-            "echo 'listeners:'; sudo ss -lntp | egrep ':(443|:5000)\\b' || true",
+            f"echo 'listeners:'; sudo ss -lntp | egrep ':(443|:{port})\\b' || true",
             "echo 'nginx status:'; sudo systemctl status nginx --no-pager || true",
-            "echo 'nginx app.conf (head):'; sudo sed -n '1,200p' /etc/nginx/conf.d/app.conf || true",
+            "echo 'nginx app.conf (head):'; sudo sed -n '1,220p' /etc/nginx/conf.d/app.conf || true",
             "echo 'nginx err (tail):'; sudo tail -n 120 /var/log/nginx/error.log || true",
-            "echo 'petstore logs (tail):'; sudo docker logs --tail 200 petstore || true",
+            f"echo '{cname} logs (tail):'; sudo docker logs --tail 200 {cname} || true",
           ]
 
           if debug == "true":
               commands += [
                 "echo '=== Diagnostics (VERBOSE) ==='",
-                "echo 'nginx -T (head):'; sudo /usr/sbin/nginx -T 2>&1 | sed -n '1,400p' || true",
+                "echo 'nginx -T (head):'; sudo /usr/sbin/nginx -T 2>&1 | sed -n '1,450p' || true",
                 "echo 'docker ps -a:'; sudo docker ps -a || true",
-                "echo 'docker inspect petstore (head):'; sudo docker inspect petstore 2>/dev/null | sed -n '1,200p' || true",
+                f"echo 'docker inspect {cname} (head):'; sudo docker inspect {cname} 2>/dev/null | sed -n '1,220p' || true",
                 "echo 'journalctl nginx (tail):'; sudo journalctl -u nginx --no-pager -n 200 || true",
                 "echo 'journalctl docker (tail):'; sudo journalctl -u docker --no-pager -n 200 || true",
               ]
@@ -449,34 +462,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          # From workflow env / inputs
           APP_NAME="${APP_NAME}"
           SA_ACRONYM="${SA_ACRONYM}"
           TLS_MODE="${TLS_MODE}"
           DEBUG_LOGS="${DEBUG_LOGS}"
           AWS_REGION="${AWS_REGION}"
+          APP_PORT="${APP_PORT}"
+          CONTAINER_NAME="${CONTAINER_NAME}"
 
-          # From provision-ec2 job outputs
           DAST_URL="${{ needs.provision-ec2.outputs.dast_url }}"
           DNS_NAME="${{ needs.provision-ec2.outputs.dns_name }}"
           PUBLIC_IP="${{ needs.provision-ec2.outputs.public_ip }}"
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           ECR_REPO="${{ needs.provision-ec2.outputs.ecr_repo }}"
-
-          # From build-and-push outputs (available because this job needs build-and-push)
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
 
-          # Keep normal log output
-          echo "DAST URL:    ${DAST_URL}"
-          echo "TLS Test:    ${DAST_URL}/tls-info"
-          echo "DNS Name:    ${DNS_NAME}"
-          echo "Public IP:   ${PUBLIC_IP}"
-          echo "Instance ID: ${INSTANCE_ID}"
-          echo "ECR Repo:    ${ECR_REPO}"
-          echo "Image URI:   ${IMAGE_URI}"
-          echo "DEBUG_LOGS:  ${DEBUG_LOGS}"
+          echo "DAST URL:       ${DAST_URL}"
+          echo "TLS Test:       ${DAST_URL}/tls-info"
+          echo "DNS Name:       ${DNS_NAME}"
+          echo "Public IP:      ${PUBLIC_IP}"
+          echo "Instance ID:    ${INSTANCE_ID}"
+          echo "ECR Repo:       ${ECR_REPO}"
+          echo "Image URI:      ${IMAGE_URI}"
+          echo "App Port:       ${APP_PORT}"
+          echo "Container Name: ${CONTAINER_NAME}"
+          echo "DEBUG_LOGS:     ${DEBUG_LOGS}"
 
-          # GitHub Actions Summary
           {
             echo "## Deployment Summary"
             echo ""
@@ -484,6 +495,8 @@ jobs:
             echo "- **SA Acronym:** ${SA_ACRONYM:-unknown}"
             echo "- **Region:** ${AWS_REGION:-unknown}"
             echo "- **TLS Mode:** ${TLS_MODE:-unknown}"
+            echo "- **App Port:** ${APP_PORT:-unknown}"
+            echo "- **Container:** ${CONTAINER_NAME:-unknown}"
             echo "- **Debug Logs:** ${DEBUG_LOGS:-false}"
             echo ""
             echo "### 🌐 Endpoint"
@@ -496,4 +509,7 @@ jobs:
             echo "- **Instance ID:** \`${INSTANCE_ID:-not-set}\`"
             echo "- **ECR Repo:** \`${ECR_REPO:-not-set}\`"
             echo "- **Image URI:** \`${IMAGE_URI:-not-set}\`"
+            echo ""
+            echo "### ✅ Quick checks"
+            echo "- Hit: \`${DAST_URL:-}/tls-info\` (should show mode=Weak or mode=Secure)"
           } >> "$GITHUB_STEP_SUMMARY"
