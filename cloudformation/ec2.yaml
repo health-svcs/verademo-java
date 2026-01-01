@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Launch EC2 instance for API (nginx/docker configured by SSM)"
+
+Parameters:
+  AMIId:
+    Type: String
+    Description: "AMI ID to launch from"
+  InstanceType:
+    Type: String
+    Description: "EC2 instance type"
+  SubnetId:
+    Type: String
+    Description: "Subnet ID"
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: "Security group IDs"
+  IamInstanceProfileName:
+    Type: String
+    Description: "IAM instance profile name"
+  KeyName:
+    Type: String
+    Description: "EC2 key pair name"
+
+  DeployTagKey:
+    Type: String
+    Description: "Tag key used to identify demo owner"
+  DeployTagValue:
+    Type: String
+    Description: "Tag value used to identify demo owner"
+
+  AppName:
+    Type: String
+    Default: "petstore.api"
+    Description: "App label for tagging/DNS"
+
+  ImageTag:
+    Type: String
+    Default: "unknown"
+    Description: "Image tag used for traceability"
+
+  TlsMode:
+    Type: String
+    Default: "Weak"
+    AllowedValues: ["Weak", "Secure"]
+    Description: "TLS posture label (applied by SSM deploy step)"
+
+  # --- NEW: GitHub identity for EC2 Name tag ---
+  RepoOrg:
+    Type: String
+    Default: "unknown-org"
+    Description: "GitHub org/owner (e.g., health-svcs)"
+  RepoName:
+    Type: String
+    Default: "unknown-repo"
+    Description: "GitHub repo name (e.g., agc-petstore.api)"
+  RunId:
+    Type: String
+    Default: "unknown-run"
+    Description: "GitHub run id for traceability"
+
+Resources:
+  ApiInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AMIId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: !Ref SecurityGroupIds
+      IamInstanceProfile: !Ref IamInstanceProfileName
+      KeyName: !Ref KeyName
+
+      Tags:
+        - Key: !Ref DeployTagKey
+          Value: !Ref DeployTagValue
+        - Key: "App"
+          Value: !Ref AppName
+        - Key: "TlsMode"
+          Value: !Ref TlsMode
+        - Key: "ImageTag"
+          Value: !Ref ImageTag
+
+        # UPDATED: EC2 "Name" tag (no AppName prefix anymore)
+        - Key: "Name"
+          Value: !Sub "${RepoOrg}-${RepoName}-ec2-${RunId}"
+
+Outputs:
+  InstanceId:
+    Description: "EC2 InstanceId"
+    Value: !Ref ApiInstance
+
+  PublicIp:
+    Description: "EC2 Public IPv4 (for Route53 A record)"
+    Value: !GetAtt ApiInstance.PublicIp
+
+  PublicDnsName:
+    Description: "EC2 Public DNS name"
+    Value: !GetAtt ApiInstance.PublicDnsName
+
+  TlsMode:
+    Description: "TLS mode label"
+    Value: !Ref TlsMode
+
+  ImageTag:
+    Description: "Image tag label"
+    Value: !Ref ImageTag
