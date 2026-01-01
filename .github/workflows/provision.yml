@@ -30,13 +30,20 @@ on:
         default: false
         type: boolean
 
+  push:
+    branches: ["main"]
+
 env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
   # Per-app master defaults (override via inputs if desired)
   APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT || 'verademo.java' }}
+
+  # IMPORTANT for push runs:
+  # - push has no inputs, so SA_ACRONYM must come from vars.SA_ACRONYM_DEFAULT
   SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT || 'xxx' }}
+
   TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Secure' }}
 
   # verademo-java container typically listens on 8080 (NGINX terminates TLS on 443 and proxies to this)
@@ -44,6 +51,7 @@ env:
   CONTAINER_NAME: ${{ vars.CONTAINER_NAME || 'verademo-java' }}
 
   # Boolean -> string "true"/"false"
+  # For push runs, inputs.DEBUG_LOGS is empty -> defaults to false.
   DEBUG_LOGS: ${{ (inputs.DEBUG_LOGS && 'true') || 'false' }}
 
   # ECR repo name: derived from APP_NAME but sanitized for ECR
@@ -62,7 +70,7 @@ jobs:
   validate-inputs:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate required repo/org variables
+      - name: Validate required repo/org variables + inputs
         shell: bash
         run: |
           set -euo pipefail
@@ -89,6 +97,20 @@ jobs:
 
           if ! [[ "${APP_PORT}" =~ ^[0-9]+$ ]]; then
             echo "ERROR: APP_PORT must be numeric, got: '${APP_PORT}'"
+            exit 1
+          fi
+
+          # Guardrail: Do not allow placeholder SA acronym.
+          # This catches both:
+          # - workflow_dispatch where user forgot to change from 'xxx'
+          # - push runs where vars.SA_ACRONYM_DEFAULT was not set
+          if [[ "${SA_ACRONYM}" == "xxx" ]]; then
+            echo "ERROR: SA_ACRONYM is 'xxx'. Set repo/org variable SA_ACRONYM_DEFAULT (recommended), or pass SA_ACRONYM via workflow_dispatch."
+            exit 1
+          fi
+
+          if ! [[ "${SA_ACRONYM}" =~ ^[a-zA-Z0-9]{3,8}$ ]]; then
+            echo "ERROR: SA_ACRONYM must be 3-8 chars (letters/numbers), got: '${SA_ACRONYM}'"
             exit 1
           fi
 
@@ -273,7 +295,6 @@ jobs:
           aws ecr get-login-password --region "${AWS_REGION}" | \
             docker login --username AWS --password-stdin "${REGISTRY}"
 
-          # If your Dockerfile is not at repo root, adjust build context accordingly.
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
 
@@ -353,7 +374,6 @@ jobs:
           b64_dcfg  = base64.b64encode(docker_cfg.encode()).decode()
 
           commands = [
-            # IMPORTANT: SSM RunShellScript uses /bin/sh (dash). No pipefail.
             "set -eu",
 
             "echo '=== OS ==='; cat /etc/os-release || true",
@@ -391,7 +411,6 @@ jobs:
             "echo '=== Pull & run container ==='",
             f"sudo docker pull '{image}'",
             f"sudo docker rm -f {cname} || true",
-            # bind container port to localhost only; nginx proxies to it
             f"sudo docker run -d --name {cname} --restart unless-stopped -p 127.0.0.1:{port}:{port} '{image}'",
 
             "echo '=== Diagnostics (slim) ==='",
