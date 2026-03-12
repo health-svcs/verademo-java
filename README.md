@@ -1,4 +1,4 @@
-# VeraDemo - Blab-a-Gag 12-31-25 agc  now 3/11/2026
+# VeraDemo - Blab-a-Gag 12-31-25 agc  now 3/11/2026 and then 3/12
 
 ### Notice
 
